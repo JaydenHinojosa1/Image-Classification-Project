@@ -1,0 +1,377 @@
+---
+title: "Image Classification Project"
+authors: Jayden Carr and Juan Carballo
+---
+
+# Importing libraries
+```{r}
+library(readr)
+library(dplyr)
+library(jsonlite)
+library(ggplot2)
+library(magick)
+library(stringr)
+library(data.table)
+```
+
+# Data Extraction and Transformation
+# Loading labels from Json files
+```{r}
+image_person <- fromJSON("labels/person_keypoints_train2017.json") #person labels
+image_panoptic <- fromJSON("labels/panoptic_train2017.json") #keypoints for all pictures
+image_stuff <- fromJSON("labels/stuff_train2017.json") #stuff labels - other than person
+```
+
+# Creating person data frame
+```{r}
+person_df <- data.frame(image_id = image_person$images$id,
+                        image_name = image_person$images$file_name)
+head(person_df)
+```
+
+# Extracting annotations from Nested values in Person data set
+```{r}
+image_person_annotations <- image_person$annotations %>%
+  select(image_id,category_id,iscrowd,num_keypoints,area,bbox,keypoints)
+```
+
+# Adding annotations to person data frame
+```{r}
+person_df <- person_df %>%
+  inner_join(image_person_annotations)
+```
+
+# Getting categories from panoptic json data sets
+```{r}
+image_panoptic_category <- image_panoptic$categories %>%
+  select(category_id = id,category_name = supercategory)
+```
+
+# Adding category to person data frame
+```{r}
+person_df <- person_df %>%
+  inner_join(image_panoptic_category)
+```
+
+# Extracting data from stuff data frame
+```{r}
+stuff_df <- data.frame(image_id = image_stuff$images$id,
+                        image_name = image_stuff$images$file_name)
+head(stuff_df)
+```
+
+# Getting annotations from stuff data frame
+```{r}
+image_stuff_annotations <- image_stuff$annotations %>%
+  select(image_id,category_id,iscrowd,area,bbox)
+
+image_stuff_annotations$num_keypoints=as.integer(0)
+image_stuff_annotations$keypoints=as.integer(0)
+```
+
+# Adding annotations to stuff data frame
+```{r}
+stuff_df <- stuff_df %>%
+  inner_join(image_stuff_annotations)
+```
+
+# Re-ordering columns to match person data frame's format
+```{r}
+stuff_df <- stuff_df %>%
+  select(image_id,image_name,category_id,iscrowd,num_keypoints,area,bbox,keypoints)
+```
+
+# Adding category name to stuff data frame
+```{r}
+stuff_df <- stuff_df %>%
+  inner_join(image_panoptic_category)
+```
+
+# Subsetting both data frames for testing purposes
+```{r}
+person_df <- person_df[1:25000,]
+stuff_df <- stuff_df[1:25000,]
+stuff_df$keypoints <- person_df$keypoints[2]
+```
+
+# Extract keypoints from vector stored in keypoints column
+```{r}
+#loop to get all keypoints
+keypoints_df <- data.frame()
+keypoints_t_df <- data.frame()
+keypoints_stuff_df <- data.frame()
+keypoints_stuff_t_df <- data.frame()
+
+for(i in 1:nrow(person_df)){
+  keypoints_df <- as.data.frame(person_df$keypoints[i])
+  keypoints_t_df <- rbind(keypoints_t_df,transpose(keypoints_df))
+  keypoints_stuff_df <- as.data.frame(stuff_df$keypoints[i])
+  keypoints_stuff_t_df <- rbind(keypoints_stuff_t_df,transpose(keypoints_stuff_df))
+}
+```
+
+# Adding keypoint columns to both data frames
+```{r}
+person_df <- cbind(person_df,keypoints_t_df)
+stuff_df <- cbind(stuff_df,keypoints_stuff_t_df)
+```
+
+# Dropping unnecesary columns
+```{r}
+person_df <- person_df %>%
+  select(-bbox,-keypoints)
+
+stuff_df <- stuff_df %>%
+  select(-bbox,-keypoints)
+```
+
+# Joining person and stuff data frames
+```{r}
+final_df <- person_df %>%
+  full_join(stuff_df)
+```
+
+# Setting classes to person and not a person (other)
+```{r}
+final_df$category_name <- ifelse(final_df$category_name == "person","person","other")
+```
+
+# Exporting final data frame to csv
+```{r}
+write.csv(final_df, file = "final_df.csv")
+```
+
+# Model 1 - Naive Bayes
+```{r}
+#loading data set
+DATA_SET = "final_df.csv"
+SPLIT_RATIO = .75
+
+#load h2o
+library(h2o)
+
+#initialize local h2o connection
+localH2O <- h2o.init(nthreads = -1)
+
+#import data
+h2oImageClass <- h2o.importFile(DATA_SET)
+print(h2oImageClass)
+cor(h2oImageClass)
+
+#split data
+imageclassSplit <- h2o.splitFrame(data = h2oImageClass, ratios = SPLIT_RATIO)
+train <- imageclassSplit[[1]]
+test <- imageclassSplit[[2]]
+
+#naive bayes model
+nbModel <- h2o.naiveBayes(y = "category_name",
+                          training_frame = train,
+                          validation_frame = test)
+print(nbModel)
+
+```
+
+# Model 1 - Predicting
+```{r}
+#predict
+predictedCategory <- h2o.predict(nbModel, newdata = test)
+print(predictedCategory)
+
+#gather performance
+nbPerformance <- h2o.performance(nbModel, test)
+print(nbPerformance)
+
+#generate
+print(h2o.confusionMatrix(nbModel, test))
+
+#accuracy and area under the curve
+print(h2o.accuracy(nbPerformance))
+print(h2o.auc(nbPerformance))
+
+#table
+table = table(as.vector(predictedCategory$predict), as.vector(test$category_name))
+
+#Accuracy
+accuracyModel1 = sum(diag(table) / sum(rowSums(table)))
+accuracyModel1
+
+#Precision
+precisionModel1 = sum(diag(table) / sum(rowSums(table)))
+precisionModel1
+
+#Recall
+recallModel1 = sum(diag(table) / sum(rowSums(table)))
+recallModel1
+```
+
+# Model 2 - Random Forest
+```{r}
+#split data
+imageclassSplit <- h2o.splitFrame(data = h2oImageClass, ratios = SPLIT_RATIO)
+train <- imageclassSplit[[1]]
+test <- imageclassSplit[[2]]
+
+#naive bayes model
+rfModel <- h2o.randomForest(y = "category_name",
+                          training_frame = train,
+                          validation_frame = test)
+print(rfModel)
+```
+
+# Model 2 - Predicting
+```{r}
+#predict
+predictedCategory <- h2o.predict(rfModel, newdata = test)
+print(predictedCategory)
+
+#gather performance
+rfPerformance <- h2o.performance(nbModel, test)
+print(rfPerformance)
+
+#generate
+print(h2o.confusionMatrix(nbModel, test))
+
+#accuracy and area under the curve
+print(h2o.accuracy(rfPerformance))
+print(h2o.auc(rfPerformance))
+
+#table
+table = table(as.vector(predictedCategory$predict), as.vector(test$category_name))
+
+#Accuracy
+accuracyModel2 = sum(diag(table) / sum(rowSums(table)))
+accuracyModel2
+
+#Precision
+precisionModel2 = sum(diag(table) / sum(rowSums(table)))
+precisionModel2
+
+#Recall
+recallModel2 = sum(diag(table) / sum(rowSums(table)))
+recallModel2
+```
+
+# Model 3 - Deep Learning
+```{r}
+library(h2o)
+
+#split data
+imageclassSplit <- h2o.splitFrame(data = h2oImageClass, ratios = SPLIT_RATIO)
+train <- imageclassSplit[[1]]
+test <- imageclassSplit[[2]]
+
+#Convert to H2O objects
+h2oTrain <- as.h2o(train)
+h2oTest <- as.h2o(test)
+
+h2oDL <- h2o.deeplearning(x = colnames(h2oTrain),
+                          y = c("category_name"),
+                          training_frame = h2oTrain,
+                          hidden = c(16,16,16),
+                          epochs=100,
+                          seed=12345)
+h2oDL@model$scoring_history
+```
+
+# Model 3 - Predicting
+```{r}
+pred <- h2o.predict(h2oDL, h2oTest)
+table = table(as.vector(pred$predict), as.vector(h2oTest$category_name))
+
+#Accuracy
+accuracy = sum(diag(table)/sum(rowSums(table)))
+cat("3 layer accuracy:", accuracy)
+
+
+#ADDING VALIDATION FRAME
+h2oDL <- h2o.deeplearning(x = colnames(h2oTrain),
+                          y = c("category_name"),
+                          training_frame = h2oTrain,
+                          hidden = c(16,16,16),
+                          epochs=100,
+                          seed=12345,
+                          nfolds = 3)
+h2oDL@model$scoring_history
+
+pred <- h2o.predict(h2oDL, h2oTest)
+table = table(as.vector(pred$predict), as.vector(h2oTest$category_name))
+
+#Accuracy
+accuracyModel3 = sum(diag(table)/sum(rowSums(table)))
+cat("N folds 3 validation accuracy:", accuracyModel3)
+
+#Precision
+precisionModel3 = sum(diag(table)/sum(rowSums(table)))
+cat("N folds 3 validation accuracy:", precisionModel3)
+
+#Recall
+recallModel3 = sum(diag(table)/sum(rowSums(table)))
+cat("N folds 3 validation accuracy:", recallModel3)
+
+```
+
+# Model 4 - Support Vector Machine
+```{r}
+library(kernlab)
+DATA_SET <- read.csv("final_df.csv")
+View(DATA_SET)
+
+set.seed(12345)
+#split data
+sample_train <- data.frame()
+sample_val <- data.frame()
+
+sample_train <- (nrow(DATA_SET)*.6)
+sample_val <- (nrow(DATA_SET)*.8)
+train <- DATA_SET[1:sample_train,]
+sample_train <- sample_train+1
+validation <- DATA_SET[sample_train:sample_val,]
+sample_val <- sample_val+1
+test <- DATA_SET[sample_val:nrow(DATA_SET),]
+
+modelSVM <- ksvm(category_name ~ .,
+                 data = train,
+                 kernel = "vanilladot")
+
+modelSVM
+```
+
+# Model 4 - Predicting
+```{r}
+#predict
+pred <- predict(modelSVM, test)
+
+#generate confusion matrix
+confusionMatrix <- table(pred,
+                         test$category_name,
+                         dnn = c("Prediction", "Actual"))
+
+#Accuracy
+accuracyModel4 <- sum(diag(confusionMatrix)) / sum(confusionMatrix)
+cat("Vanilla Kernel Accuracy:", accuracyModel4)
+
+#Precision
+precisionModel4 <- sum(diag(confusionMatrix)) / sum(confusionMatrix)
+cat("Vanilla Kernel Accuracy:", precisionModel4)
+
+#Recall
+recallModel4 <- sum(diag(confusionMatrix)) / sum(confusionMatrix)
+cat("Vanilla Kernel Accuracy:", recallModel4)
+
+```
+
+# Demonstration
+```{r}
+#read picture
+image_path <- 'https://stu-rstatsdata.s3.amazonaws.com/imageclass/train/'
+image_name <- person_df$image_name[1]
+image_location <- str_c(image_path,image_name,sep = "")
+image_read(image_location, density = NULL, depth = NULL, strip = FALSE)
+```
+
+# Passing Picture into Deep Learning for prediction
+```{r}
+testing_df <- 
+```
+
+
